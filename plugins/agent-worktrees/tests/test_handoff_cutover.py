@@ -1072,6 +1072,63 @@ class TestCmdHandoffCutover:
         assert complete[0]["successor_session_id"] == "new-sess"
         assert complete[0]["handoff_token"] == "task-retire-13"
 
+    def test_retire_confirmed_dead_predecessor_clears_zombie_head(
+        self, monkeypatch, capfd, tmp_tracking_dir, monkeypatch_config,
+    ):
+        """aperture-labs#4702: a bare self-retire (no handoff-token successor
+        -- e.g. a double-Ctrl-C idle-quit with nobody waiting to take over)
+        must not leave the retired session's ``SessionEntry.state`` stuck at
+        ``"active"`` once its Copilot process is positively confirmed dead.
+        A stuck-active predecessor otherwise permanently blocks
+        ``register_session``'s creation-guard from ever promoting a later
+        successor to head."""
+        from agent_worktrees import tracking as _tracking
+
+        rec = _tracking.WorktreeRecord(
+            worktree_id="wt-retire-4702", branch="worktree/wt-retire-4702",
+            worktree_path="/tmp/src/wt-retire-4702", repo="test-repo",
+            machine="test", platform="wsl", started_at="2026-06-01T10:00:00",
+            last_resumed_at="2026-06-01T10:00:00", resume_count=0, title=None,
+            status="active", completed_at=None, sessions=[],
+        )
+        _tracking.save_record(rec, tmp_tracking_dir / "wt-retire-4702.yaml")
+        _tracking.register_session("wt-retire-4702", "old-sess")
+        before = _tracking.load_record(tmp_tracking_dir / "wt-retire-4702.yaml")
+        assert before.resolved_head_session == "old-sess"
+
+        monkeypatch.setattr(
+            sessions, "mux_retire_pane",
+            lambda p, **k: {"ok": True, "pane": p, "gone": True, "method": "graceful"},
+        )
+        monkeypatch.setattr(
+            reclaim, "ensure_session_copilot_reaped",
+            lambda sid, **kwargs: {
+                "checked": True, "identity_verified": True, "found": 1,
+                "reaped": 1, "survivors": 0, "pids": [7],
+            },
+        )
+        monkeypatch.setattr(activity, "log_event", lambda *a, **k: None)
+
+        rc = m.cmd_handoff_cutover(_ns(
+            worktree_id="wt-retire-4702",
+            retire_pane="%9",
+            session_id="old-sess",
+        ))
+
+        assert rc == 0
+        out = json.loads(capfd.readouterr().out)
+        assert out["ok"] is True
+
+        after = _tracking.load_record(tmp_tracking_dir / "wt-retire-4702.yaml")
+        entry = after.session_entry("old-sess")
+        assert entry.state == "concluded"
+        # The head pointer must clear -- not stay stuck on the dead session --
+        # so a later successor registration is not blocked by the creation-guard.
+        assert after.resolved_head_session is None
+        _tracking.register_session("wt-retire-4702", "new-sess")
+        final = _tracking.load_record(tmp_tracking_dir / "wt-retire-4702.yaml")
+        assert final.resolved_head_session == "new-sess"
+
     def test_retire_reaps_old_copilot_before_success(self, monkeypatch, capfd):
         # A hard pane-kill left the pane gone; the OLD Copilot process is then
         # reaped, and only then is success declared.

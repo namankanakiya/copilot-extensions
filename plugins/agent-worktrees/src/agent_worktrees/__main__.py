@@ -3573,6 +3573,34 @@ def _maybe_emit_stage_13(
             claim_path.unlink()
 
 
+def _conclude_retired_predecessor(wt_id: str | None, session_id: str) -> None:
+    """Mark a retire-confirmed predecessor's ``SessionEntry`` concluded.
+
+    A confirmed ``--retire-pane`` (pane gone AND its Copilot process
+    positively verified dead by pid) is a deliberate, verified act -- not
+    liveness inference -- so it is safe to assert conclusion here, same as
+    ``conclude-session``'s own contract. Without this, a session whose
+    process died via a bare self-retire (no handoff-token successor link)
+    leaves its ``SessionEntry.state`` stuck at ``"active"`` forever, and
+    ``register_session``'s creation-guard then refuses to ever promote a
+    later successor to head (aperture-labs#4702 -- the zombie head pointer).
+    Best-effort: unknown worktree/session or an already-concluded entry is a
+    silent no-op, never a hard failure of the retire itself.
+    """
+    if not wt_id or not session_id:
+        return
+    yaml_path = cfg.tracking_dir() / f"{wt_id}.yaml"
+    if not yaml_path.exists():
+        return
+    with contextlib.suppress(Exception), tracking._RecordLock(yaml_path):
+        record = tracking.load_record(yaml_path)
+        entry = record.session_entry(session_id)
+        if entry is None or entry.state != "active":
+            return
+        tracking.conclude_session(record, session_id, state="concluded", save=False)
+        tracking.save_record(record, yaml_path)
+
+
 def _handoff_cutover_retire_result(
     args: argparse.Namespace,
 ) -> tuple[int, dict[str, object]]:
@@ -3659,6 +3687,8 @@ def _handoff_cutover_retire_result(
     skipped_identity = result.get("method") == "identity-mismatch-skip"
     overall_ok = bool(result.get("ok")) and proc_ok
     result["ok"] = overall_ok
+    if overall_ok and session_id:
+        _conclude_retired_predecessor(wt_id, session_id)
     activity.log_event(
         "handoff_predecessor_retire",
         worktree_id=wt_id,
