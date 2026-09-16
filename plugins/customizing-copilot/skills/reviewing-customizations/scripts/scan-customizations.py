@@ -534,6 +534,31 @@ def _plugin_version(footprint: Path) -> str:
     return ""
 
 
+def _plugin_manifest_path(footprint: Path) -> Path:
+    """Return whichever manifest spelling exists, preferring the root one."""
+    root_manifest = footprint / "plugin.json"
+    if root_manifest.is_file():
+        return root_manifest
+    return footprint / ".claude-plugin" / "plugin.json"
+
+
+def _plugin_declares_agents(footprint: Path) -> bool:
+    """Whether the plugin manifest declares a truthy top-level `agents` field.
+
+    The runtime's documented behavior falls back to `plugin_root/agents` when
+    this field is absent, but every shipped example (e.g.
+    `copilot-extensions-harness`) declares it explicitly, and explicit is more
+    robust than implicit: it survives a future change to the default-path
+    fallback and gives a reviewer an unambiguous manifest to read. Mirrors
+    `_plugin_version`'s two-manifest-spelling lookup, but does not merge across
+    spellings: the first manifest found (root `plugin.json`, else
+    `.claude-plugin/plugin.json`) is authoritative, matching the runtime's own
+    precedence.
+    """
+    data = _load_json(_plugin_manifest_path(footprint))
+    return bool(data.get("agents"))
+
+
 def _plugin_hook_files(footprint: Path) -> set[Path]:
     """Return conventional and manifest-declared hook files for a plugin."""
     manifest_data: dict = {}
@@ -1666,6 +1691,7 @@ def scan_agents(
     agent_files: dict[Path, PluginSource | None] = {}
     owned_plugin_agents: set[tuple[str, str]] = set()
     checked_mcp_plugins: set[Path] = set()
+    checked_agent_manifest_plugins: set[Path] = set()
     for af in repo_owned_agent_files(root, owned_agent_roots):
         agent_files[af.resolve()] = None
     for af in root.glob("plugins/*/agents/*.agent.md"):
@@ -1732,6 +1758,22 @@ def scan_agents(
             r"(?im)^\s*mcp-servers\s*:", frontmatter
         ))
         plugin_root = plugin_root_for_agent(root, af, source)
+        if plugin_root is not None:
+            plugin_key = plugin_root.resolve()
+            if plugin_key not in checked_agent_manifest_plugins:
+                checked_agent_manifest_plugins.add(plugin_key)
+                if not _plugin_declares_agents(plugin_root):
+                    add(
+                        "agent-manifest-declaration",
+                        "plugin ships agents/*.agent.md but its manifest "
+                        f"({_plugin_manifest_path(plugin_root)}) does not "
+                        'declare a truthy top-level `agents` field (e.g. '
+                        '`"agents": "agents/"`) -- the runtime currently '
+                        "falls back to `plugin_root/agents` when this is "
+                        "absent, but declare it explicitly anyway: it matches "
+                        "every shipped example and is more robust than "
+                        "relying on an implicit default",
+                    )
         if has_mcp and plugin_root is not None:
             plugin_key = plugin_root.resolve()
             if plugin_key not in checked_mcp_plugins:
